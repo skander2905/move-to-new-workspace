@@ -8,6 +8,9 @@ import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extension
 
 export default class MoveToNewWorkspaceExtension extends Extension {
     enable() {
+        this._disabled = false;
+        this._pendingWindows = new Set();
+        this._hiddenHandlerId = 0;
         this._injections = new InjectionManager();
         this._buttons = new Set();
 
@@ -33,6 +36,15 @@ export default class MoveToNewWorkspaceExtension extends Extension {
     }
 
     disable() {
+        this._disabled = true;
+
+        if (this._hiddenHandlerId) {
+            Main.overview.disconnect(this._hiddenHandlerId);
+            this._hiddenHandlerId = 0;
+        }
+        this._pendingWindows?.clear();
+        this._pendingWindows = null;
+
         this._injections?.clear();
         this._injections = null;
 
@@ -72,21 +84,72 @@ export default class MoveToNewWorkspaceExtension extends Extension {
             pivot_point: new Graphene.Point({x: 0.5, y: 0.5}),
         }));
 
-        button.connect('clicked', () => this._moveToNewWorkspace(metaWindow));
+        // change_workspace() drops this preview while the click is still
+        // running, and Clutter aborts. Close the overview first, then move.
+        button.connect('clicked', () => {
+            button.reactive = false;
+            this._queueMove(metaWindow);
+        });
         button.connect('destroy', () => this._buttons?.delete(button));
 
         clone.add_child(button);
         this._buttons.add(button);
     }
 
+    _queueMove(metaWindow) {
+        if (this._disabled || !this._pendingWindows)
+            return;
+
+        this._pendingWindows.add(metaWindow);
+
+        if (!Main.overview.visible) {
+            this._flushPendingMoves();
+            return;
+        }
+
+        // A hide is already in flight. This window rides the same hidden signal.
+        if (this._hiddenHandlerId)
+            return;
+
+        this._hiddenHandlerId = Main.overview.connect('hidden', () => {
+            const id = this._hiddenHandlerId;
+            this._hiddenHandlerId = 0;
+            if (id)
+                Main.overview.disconnect(id);
+            this._flushPendingMoves();
+        });
+        Main.overview.hide();
+    }
+
+    _flushPendingMoves() {
+        const pending = this._pendingWindows;
+        if (!pending)
+            return;
+
+        const windows = [...pending];
+        pending.clear();
+        if (this._disabled)
+            return;
+
+        for (const metaWindow of windows)
+            this._moveToNewWorkspace(metaWindow);
+    }
+
     _moveToNewWorkspace(metaWindow) {
+        if (this._disabled)
+            return;
+        if (!metaWindow || metaWindow.get_compositor_private() == null)
+            return;
+
         const wm = global.workspace_manager;
         const time = global.get_current_time();
 
         // Put the new workspace right after the window's current one.
         const current = metaWindow.get_workspace();
-        const pos = current ? current.index() + 1 : wm.get_n_workspaces();
+        if (!current)
+            return;
 
+        const pos = current.index() + 1;
         const newWs = wm.append_new_workspace(false, time);
         wm.reorder_workspace(newWs, pos);
 
